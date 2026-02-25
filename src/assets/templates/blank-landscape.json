@@ -1,0 +1,38 @@
+{
+  "id": "blank-landscape",
+  "name": "白紙 (横)",
+  "orientation": "landscape",
+  "thumbnail": "",
+  "category": "blank",
+  "isBuiltIn": true,
+  "canvasJSON": "{\"version\":\"6.0.0\",\"objects\":[]}",
+  "placeholders": [
+    {
+      "id": "heading-zone",
+      "type": "heading",
+      "left": 40,
+      "top": 40,
+      "width": 1043,
+      "height": 120,
+      "zIndex": 0
+    },
+    {
+      "id": "image-zone-1",
+      "type": "image",
+      "left": 40,
+      "top": 180,
+      "width": 1043,
+      "height": 420,
+      "zIndex": 1
+    },
+    {
+      "id": "body-zone",
+      "type": "text",
+      "left": 40,
+      "top": 620,
+      "width": 1043,
+      "height": 134,
+      "zIndex": 2
+    }
+  ]
+}

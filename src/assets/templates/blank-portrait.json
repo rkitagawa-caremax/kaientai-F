@@ -1,0 +1,38 @@
+{
+  "id": "blank-portrait",
+  "name": "白紙 (縦)",
+  "orientation": "portrait",
+  "thumbnail": "",
+  "category": "blank",
+  "isBuiltIn": true,
+  "canvasJSON": "{\"version\":\"6.0.0\",\"objects\":[]}",
+  "placeholders": [
+    {
+      "id": "heading-zone",
+      "type": "heading",
+      "left": 40,
+      "top": 40,
+      "width": 714,
+      "height": 160,
+      "zIndex": 0
+    },
+    {
+      "id": "image-zone-1",
+      "type": "image",
+      "left": 40,
+      "top": 220,
+      "width": 714,
+      "height": 620,
+      "zIndex": 1
+    },
+    {
+      "id": "body-zone",
+      "type": "text",
+      "left": 40,
+      "top": 860,
+      "width": 714,
+      "height": 223,
+      "zIndex": 2
+    }
+  ]
+}
