@@ -21,7 +21,7 @@ export function Header() {
       <div className="header-right">
         {user && (
           <>
-            <span className="user-name">{user.displayName ?? 'User'}</span>
+            <span className="user-name">{user.displayName ?? 'ユーザー'}</span>
             <button className="btn btn-outline" onClick={handleSignOut}>
               ログアウト
             </button>

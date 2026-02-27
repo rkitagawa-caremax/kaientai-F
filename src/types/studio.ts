@@ -2,6 +2,7 @@ export type ElementKind = 'frame' | 'image';
 export type FitMode = 'cover' | 'contain';
 export type BorderStyle = 'solid' | 'dashed';
 export type CanvasPreset = 'portrait' | 'landscape';
+export type PlaceholderType = 'generic' | 'image-slot' | 'text-main' | 'text-sub';
 
 export interface TemplateRect {
   x: number;
@@ -13,6 +14,7 @@ export interface TemplateRect {
 export interface TemplateElement extends TemplateRect {
   id: string;
   kind: ElementKind;
+  placeholderType: PlaceholderType;
   name: string;
   src?: string;
   fit: FitMode;

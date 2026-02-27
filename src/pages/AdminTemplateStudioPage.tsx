@@ -19,6 +19,7 @@ import type {
   ElementKind,
   FitMode,
   LayoutTemplate,
+  PlaceholderType,
   StudioProjectSummary,
   TemplateElement,
   TemplateRect,
@@ -26,6 +27,7 @@ import type {
 
 type ResizeHandle = 'n' | 'e' | 's' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 type SyncState = 'connecting' | 'saving' | 'synced' | 'error';
+type CanvasMode = 'edit' | 'view';
 
 interface InteractionState {
   mode: 'move' | 'resize';
@@ -40,6 +42,17 @@ const MIN_ELEMENT_SIZE = 48;
 const DEFAULT_CANVAS_WIDTH = 900;
 const DEFAULT_CANVAS_HEIGHT = 1273;
 const HANDLE_POSITIONS: ResizeHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
+const DEFAULT_BORDER_COLOR = '#1f7a67';
+const TRANSPARENT_BORDER_COLOR = 'transparent';
+const CLOUD_ERROR_HINTS: Record<string, string> = {
+  'permission-denied': '権限がありません',
+  unauthenticated: 'ログインが必要です',
+  unavailable: 'ネットワークに接続できません',
+  'deadline-exceeded': '通信がタイムアウトしました',
+  'resource-exhausted': '保存上限を超えています',
+  'invalid-argument': '保存データが不正です',
+  'failed-precondition': 'Firestore 設定が不足しています',
+};
 
 function createId(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -65,6 +78,54 @@ function clampRectToCanvas(rect: TemplateRect, canvasWidth: number, canvasHeight
   return { x, y, width, height };
 }
 
+function resolveCloudErrorMessage(error: unknown, phase: 'connect' | 'save'): string {
+  const fallback =
+    phase === 'connect' ? 'クラウド接続に失敗しました' : 'クラウド保存に失敗しました';
+
+  const code =
+    typeof error === 'object' &&
+    error !== null &&
+    'code' in error &&
+    typeof (error as { code: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : '';
+  const normalizedCode = code.startsWith('firebase/') ? code.slice('firebase/'.length) : code;
+
+  if (normalizedCode && CLOUD_ERROR_HINTS[normalizedCode]) {
+    return `${fallback}（${CLOUD_ERROR_HINTS[normalizedCode]} / ${normalizedCode}）`;
+  }
+
+  if (normalizedCode) {
+    return `${fallback}（${normalizedCode}）`;
+  }
+
+  if (error instanceof Error && error.message) {
+    return `${fallback}（${error.message}）`;
+  }
+
+  return fallback;
+}
+
+function normalizePlaceholderType(value: unknown): PlaceholderType {
+  if (value === 'image-slot' || value === 'text-main' || value === 'text-sub') {
+    return value;
+  }
+  return 'generic';
+}
+
+function getPlaceholderLabel(placeholderType: PlaceholderType): string {
+  switch (placeholderType) {
+    case 'image-slot':
+      return '画像枠';
+    case 'text-main':
+      return 'メインタイトル枠';
+    case 'text-sub':
+      return 'サブタイトル枠';
+    default:
+      return 'フレーム';
+  }
+}
+
 function sanitizeTemplateElement(
   candidate: Partial<TemplateElement>,
   canvasWidth: number,
@@ -72,6 +133,7 @@ function sanitizeTemplateElement(
   index: number
 ): TemplateElement {
   const kind: ElementKind = candidate.kind === 'image' ? 'image' : 'frame';
+  const placeholderType = normalizePlaceholderType(candidate.placeholderType);
   const rect = clampRectToCanvas(
     {
       x: Number(candidate.x) || 0,
@@ -89,15 +151,17 @@ function sanitizeTemplateElement(
   return {
     id: typeof candidate.id === 'string' ? candidate.id : createId(),
     kind,
+    placeholderType,
     name:
       typeof candidate.name === 'string'
         ? candidate.name
         : kind === 'image'
-          ? `Image ${index + 1}`
-          : `Frame ${index + 1}`,
+          ? `画像 ${index + 1}`
+          : `${getPlaceholderLabel(placeholderType)} ${index + 1}`,
     src: kind === 'image' && typeof candidate.src === 'string' ? candidate.src : undefined,
     fit,
-    borderColor: typeof candidate.borderColor === 'string' ? candidate.borderColor : '#1f7a67',
+    borderColor:
+      typeof candidate.borderColor === 'string' ? candidate.borderColor : TRANSPARENT_BORDER_COLOR,
     borderWidth: clamp(Number(candidate.borderWidth) || 2, 0, 16),
     borderStyle,
     opacity: clamp(Number(candidate.opacity) || 1, 0.1, 1),
@@ -118,7 +182,7 @@ function sanitizeTemplate(candidate: Partial<LayoutTemplate>, index: number): La
 
   return {
     id: typeof candidate.id === 'string' ? candidate.id : createId(),
-    name: typeof candidate.name === 'string' ? candidate.name : `Template ${index + 1}`,
+    name: typeof candidate.name === 'string' ? candidate.name : `テンプレート ${index + 1}`,
     canvasWidth,
     canvasHeight,
     elements,
@@ -162,7 +226,7 @@ function formatDateTime(iso?: string): string {
 
 function sanitizeFileName(value: string): string {
   const normalized = value.trim().replace(/[\\/:*?"<>|]+/g, '_');
-  return normalized.length > 0 ? normalized : 'template';
+  return normalized.length > 0 ? normalized : 'テンプレート';
 }
 
 function readImageSizeFromFile(file: File): Promise<{ width: number; height: number }> {
@@ -179,7 +243,7 @@ function readImageSizeFromFile(file: File): Promise<{ width: number; height: num
 
     image.onerror = () => {
       URL.revokeObjectURL(objectUrl);
-      reject(new Error('Failed to read image size.'));
+      reject(new Error('画像サイズの取得に失敗しました。'));
     };
 
     image.src = objectUrl;
@@ -251,16 +315,17 @@ function resizeRectFromHandle(
 }
 
 export function AdminTemplateStudioPage() {
-  const [templates, setTemplates] = useState<LayoutTemplate[]>([createBlankTemplate('Template 1')]);
+  const [templates, setTemplates] = useState<LayoutTemplate[]>([createBlankTemplate('テンプレート 1')]);
   const [activeTemplateId, setActiveTemplateId] = useState<string>('');
   const [selectedElementId, setSelectedElementId] = useState<string | null>(null);
   const [interaction, setInteraction] = useState<InteractionState | null>(null);
   const [canvasScale, setCanvasScale] = useState<number>(1);
   const [projects, setProjects] = useState<StudioProjectSummary[]>([]);
   const [syncState, setSyncState] = useState<SyncState>('connecting');
-  const [syncMessage, setSyncMessage] = useState<string>('Cloud connecting...');
+  const [syncMessage, setSyncMessage] = useState<string>('クラウドに接続中...');
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [cloudReady, setCloudReady] = useState<boolean>(false);
+  const [canvasMode, setCanvasMode] = useState<CanvasMode>('edit');
 
   const canvasViewportRef = useRef<HTMLDivElement | null>(null);
   const imageUploadRef = useRef<HTMLInputElement | null>(null);
@@ -278,11 +343,26 @@ export function AdminTemplateStudioPage() {
     [activeTemplate, selectedElementId]
   );
 
+  const layerOverview = useMemo(() => {
+    if (!activeTemplate) return [];
+
+    const total = activeTemplate.elements.length;
+    return activeTemplate.elements
+      .map((element, index) => ({
+        element,
+        stackOrder: total - index,
+        boundsText: `X:${Math.round(element.x)} Y:${Math.round(element.y)} W:${Math.round(element.width)} H:${Math.round(element.height)}`,
+      }))
+      .reverse();
+  }, [activeTemplate]);
+
+  const isEditMode = canvasMode === 'edit';
+
   const serializedTemplates = useMemo(() => JSON.stringify(templates), [templates]);
 
   useEffect(() => {
     setSyncState('connecting');
-    setSyncMessage('Cloud connecting...');
+    setSyncMessage('クラウドに接続中...');
 
     const unsubscribe = subscribeStudioTemplates(
       (remoteTemplates) => {
@@ -291,7 +371,7 @@ export function AdminTemplateStudioPage() {
             ? remoteTemplates.map((template, index) =>
                 sanitizeTemplate(template as Partial<LayoutTemplate>, index)
               )
-            : [createBlankTemplate('Template 1')];
+            : [createBlankTemplate('テンプレート 1')];
 
         lastCloudSerializedRef.current =
           remoteTemplates.length > 0 ? JSON.stringify(sanitized) : JSON.stringify([]);
@@ -303,12 +383,12 @@ export function AdminTemplateStudioPage() {
         });
         setCloudReady(true);
         setSyncState('synced');
-        setSyncMessage('Live synced');
+        setSyncMessage('同期済み');
       },
       (error) => {
         setCloudReady(true);
         setSyncState('error');
-        setSyncMessage(error.message || 'Cloud connection failed');
+        setSyncMessage(resolveCloudErrorMessage(error, 'connect'));
       }
     );
 
@@ -340,7 +420,7 @@ export function AdminTemplateStudioPage() {
     }
 
     setSyncState('saving');
-    setSyncMessage('Cloud saving...');
+    setSyncMessage('クラウドに保存中...');
 
     saveTimerRef.current = window.setTimeout(() => {
       void (async () => {
@@ -348,11 +428,11 @@ export function AdminTemplateStudioPage() {
           await saveStudioTemplates(templates);
           lastCloudSerializedRef.current = serializedTemplates;
           setSyncState('synced');
-          setSyncMessage('Live synced');
+          setSyncMessage('同期済み');
         } catch (error) {
           console.error(error);
           setSyncState('error');
-          setSyncMessage('Cloud save failed');
+          setSyncMessage(resolveCloudErrorMessage(error, 'save'));
         }
       })();
     }, 360);
@@ -405,6 +485,12 @@ export function AdminTemplateStudioPage() {
     }
   }, [activeTemplate, selectedElementId]);
 
+  useEffect(() => {
+    if (canvasMode !== 'view') return;
+    setSelectedElementId(null);
+    setInteraction(null);
+  }, [canvasMode]);
+
   const updateActiveTemplate = useCallback(
     (updater: (template: LayoutTemplate) => LayoutTemplate) => {
       setTemplates((currentTemplates) =>
@@ -455,7 +541,7 @@ export function AdminTemplateStudioPage() {
   );
 
   const createTemplate = useCallback(() => {
-    const newTemplate = createBlankTemplate(`Template ${templates.length + 1}`);
+    const newTemplate = createBlankTemplate(`テンプレート ${templates.length + 1}`);
     setTemplates((current) => [...current, newTemplate]);
     setActiveTemplateId(newTemplate.id);
     setSelectedElementId(null);
@@ -467,7 +553,7 @@ export function AdminTemplateStudioPage() {
     const duplicated: LayoutTemplate = {
       ...activeTemplate,
       id: createId(),
-      name: `${activeTemplate.name} Copy`,
+      name: `${activeTemplate.name} のコピー`,
       createdAt: nowIso(),
       updatedAt: nowIso(),
       elements: activeTemplate.elements.map((element) => ({
@@ -484,11 +570,11 @@ export function AdminTemplateStudioPage() {
   const deleteActiveTemplate = useCallback(() => {
     if (!activeTemplate) return;
 
-    const confirmed = window.confirm(`Delete "${activeTemplate.name}"?`);
+    const confirmed = window.confirm(`「${activeTemplate.name}」を削除しますか？`);
     if (!confirmed) return;
 
     if (templates.length <= 1) {
-      const fallback = createBlankTemplate('Template 1');
+      const fallback = createBlankTemplate('テンプレート 1');
       setTemplates([fallback]);
       setActiveTemplateId(fallback.id);
       setSelectedElementId(null);
@@ -499,35 +585,104 @@ export function AdminTemplateStudioPage() {
     setSelectedElementId(null);
   }, [activeTemplate, templates.length]);
 
+  const addPlaceholderElement = useCallback(
+    (placeholderType: PlaceholderType) => {
+      if (!activeTemplate) return;
+
+      const configMap: Record<
+        PlaceholderType,
+        {
+          widthRatio: number;
+          heightRatio: number;
+          borderColor: string;
+          borderWidth: number;
+          borderStyle: BorderStyle;
+          radius: number;
+        }
+      > = {
+        generic: {
+          widthRatio: 0.38,
+          heightRatio: 0.2,
+          borderColor: TRANSPARENT_BORDER_COLOR,
+          borderWidth: 3,
+          borderStyle: 'dashed',
+          radius: 16,
+        },
+        'image-slot': {
+          widthRatio: 0.72,
+          heightRatio: 0.34,
+          borderColor: '#1f7a67',
+          borderWidth: 3,
+          borderStyle: 'dashed',
+          radius: 12,
+        },
+        'text-main': {
+          widthRatio: 0.8,
+          heightRatio: 0.12,
+          borderColor: '#1d4ed8',
+          borderWidth: 2,
+          borderStyle: 'solid',
+          radius: 10,
+        },
+        'text-sub': {
+          widthRatio: 0.68,
+          heightRatio: 0.1,
+          borderColor: '#1d4ed8',
+          borderWidth: 2,
+          borderStyle: 'dashed',
+          radius: 10,
+        },
+      };
+
+      const config = configMap[placeholderType];
+      const width = Math.round(activeTemplate.canvasWidth * config.widthRatio);
+      const height = Math.round(activeTemplate.canvasHeight * config.heightRatio);
+      const count = activeTemplate.elements.filter(
+        (item) => item.kind === 'frame' && item.placeholderType === placeholderType
+      ).length;
+
+      const element: TemplateElement = {
+        id: createId(),
+        kind: 'frame',
+        placeholderType,
+        name: `${getPlaceholderLabel(placeholderType)} ${count + 1}`,
+        x: Math.round((activeTemplate.canvasWidth - width) / 2),
+        y: Math.round((activeTemplate.canvasHeight - height) / 2),
+        width,
+        height,
+        src: undefined,
+        fit: 'cover',
+        borderColor: config.borderColor,
+        borderWidth: config.borderWidth,
+        borderStyle: config.borderStyle,
+        opacity: 1,
+        radius: config.radius,
+      };
+
+      updateActiveTemplate((template) => ({
+        ...template,
+        elements: [...template.elements, element],
+      }));
+      setSelectedElementId(element.id);
+    },
+    [activeTemplate, updateActiveTemplate]
+  );
+
   const addFrameElement = useCallback(() => {
-    if (!activeTemplate) return;
+    addPlaceholderElement('generic');
+  }, [addPlaceholderElement]);
 
-    const width = Math.round(activeTemplate.canvasWidth * 0.38);
-    const height = Math.round(activeTemplate.canvasHeight * 0.2);
+  const addImageSlotElement = useCallback(() => {
+    addPlaceholderElement('image-slot');
+  }, [addPlaceholderElement]);
 
-    const element: TemplateElement = {
-      id: createId(),
-      kind: 'frame',
-      name: `Frame ${activeTemplate.elements.filter((item) => item.kind === 'frame').length + 1}`,
-      x: Math.round((activeTemplate.canvasWidth - width) / 2),
-      y: Math.round((activeTemplate.canvasHeight - height) / 2),
-      width,
-      height,
-      src: undefined,
-      fit: 'cover',
-      borderColor: '#1f7a67',
-      borderWidth: 3,
-      borderStyle: 'dashed',
-      opacity: 1,
-      radius: 16,
-    };
+  const addTextMainSlotElement = useCallback(() => {
+    addPlaceholderElement('text-main');
+  }, [addPlaceholderElement]);
 
-    updateActiveTemplate((template) => ({
-      ...template,
-      elements: [...template.elements, element],
-    }));
-    setSelectedElementId(element.id);
-  }, [activeTemplate, updateActiveTemplate]);
+  const addTextSubSlotElement = useCallback(() => {
+    addPlaceholderElement('text-sub');
+  }, [addPlaceholderElement]);
 
   const removeSelectedElement = useCallback(() => {
     if (!selectedElementId) return;
@@ -556,7 +711,7 @@ export function AdminTemplateStudioPage() {
       ...selectedElement,
       ...shiftedRect,
       id: createId(),
-      name: `${selectedElement.name} Copy`,
+      name: `${selectedElement.name} のコピー`,
     };
 
     updateActiveTemplate((template) => ({
@@ -642,7 +797,7 @@ export function AdminTemplateStudioPage() {
         const template: LayoutTemplate = {
           ...imported,
           id: createId(),
-          name: `${imported.name} Imported`,
+          name: `${imported.name}（インポート）`,
           createdAt: nowIso(),
           updatedAt: nowIso(),
         };
@@ -651,7 +806,7 @@ export function AdminTemplateStudioPage() {
         setSelectedElementId(null);
       } catch (error) {
         console.error(error);
-        window.alert('Template JSON import failed.');
+        window.alert('テンプレートJSONの読み込みに失敗しました。');
       } finally {
         event.target.value = '';
       }
@@ -669,69 +824,106 @@ export function AdminTemplateStudioPage() {
 
       setIsUploading(true);
 
-      const createdElements: TemplateElement[] = [];
-      const maxWidth = activeTemplate.canvasWidth * 0.72;
-      const maxHeight = activeTemplate.canvasHeight * 0.6;
+      try {
+        const createdElements: TemplateElement[] = [];
+        const cloudFallbacks: string[] = [];
+        const hardFailures: string[] = [];
+        const maxWidth = activeTemplate.canvasWidth * 0.72;
+        const maxHeight = activeTemplate.canvasHeight * 0.6;
 
-      for (const [index, file] of files.entries()) {
-        const elementId = createId();
+        for (const [index, file] of files.entries()) {
+          const elementId = createId();
 
-        try {
-          const size = await readImageSizeFromFile(file);
-          const scale = Math.min(maxWidth / size.width, maxHeight / size.height, 1);
-          const width = Math.max(MIN_ELEMENT_SIZE, Math.round(size.width * scale));
-          const height = Math.max(MIN_ELEMENT_SIZE, Math.round(size.height * scale));
-          const x = clamp(
-            Math.round((activeTemplate.canvasWidth - width) / 2 + index * 22),
-            0,
-            activeTemplate.canvasWidth - width
-          );
-          const y = clamp(
-            Math.round((activeTemplate.canvasHeight - height) / 2 + index * 22),
-            0,
-            activeTemplate.canvasHeight - height
-          );
+          try {
+            const size = await readImageSizeFromFile(file);
+            const scale = Math.min(maxWidth / size.width, maxHeight / size.height, 1);
+            const width = Math.max(MIN_ELEMENT_SIZE, Math.round(size.width * scale));
+            const height = Math.max(MIN_ELEMENT_SIZE, Math.round(size.height * scale));
+            const x = clamp(
+              Math.round((activeTemplate.canvasWidth - width) / 2 + index * 22),
+              0,
+              activeTemplate.canvasWidth - width
+            );
+            const y = clamp(
+              Math.round((activeTemplate.canvasHeight - height) / 2 + index * 22),
+              0,
+              activeTemplate.canvasHeight - height
+            );
 
-          const imageUrl = await uploadTemplateImage(activeTemplate.id, elementId, file);
+            let imageUrl: string;
+            try {
+              imageUrl = await uploadTemplateImage(activeTemplate.id, elementId, file);
+            } catch (error) {
+              console.error(error);
+              const reason = error instanceof Error ? error.message : 'unknown error';
+              cloudFallbacks.push(file.name + ': ' + reason);
+              imageUrl = URL.createObjectURL(file);
+            }
 
-          createdElements.push({
-            id: elementId,
-            kind: 'image',
-            name: file.name.replace(/\.[^.]+$/, '') || `Image ${activeTemplate.elements.length + index + 1}`,
-            x,
-            y,
-            width,
-            height,
-            src: imageUrl,
-            fit: 'cover',
-            borderColor: '#d06f2e',
-            borderWidth: 2,
-            borderStyle: 'solid',
-            opacity: 1,
-            radius: 14,
-          });
-        } catch (error) {
-          console.error(error);
+            createdElements.push({
+              id: elementId,
+              kind: 'image',
+              placeholderType: 'generic',
+              name:
+                file.name.replace(/\.[^.]+$/, '') ||
+                '画像 ' + (activeTemplate.elements.length + index + 1),
+              x,
+              y,
+              width,
+              height,
+              src: imageUrl,
+              fit: 'cover',
+              borderColor: TRANSPARENT_BORDER_COLOR,
+              borderWidth: 2,
+              borderStyle: 'solid',
+              opacity: 1,
+              radius: 14,
+            });
+          } catch (error) {
+            console.error(error);
+            const reason = error instanceof Error ? error.message : 'unknown error';
+            hardFailures.push(file.name + ': ' + reason);
+          }
         }
-      }
 
-      if (createdElements.length > 0) {
-        updateActiveTemplate((template) => ({
-          ...template,
-          elements: [...template.elements, ...createdElements],
-        }));
-        setSelectedElementId(createdElements[createdElements.length - 1].id);
-      }
+        if (createdElements.length > 0) {
+          updateActiveTemplate((template) => ({
+            ...template,
+            elements: [...template.elements, ...createdElements],
+          }));
+          setSelectedElementId(createdElements[createdElements.length - 1].id);
+        }
 
-      setIsUploading(false);
-      event.target.value = '';
+        const summarize = (items: string[]) => {
+          const preview = items.slice(0, 3).join('\n');
+          const extra = items.length > 3 ? '\nほか ' + (items.length - 3) + ' 件' : '';
+          return preview + extra;
+        };
+
+        const alerts: string[] = [];
+        if (cloudFallbacks.length > 0) {
+          alerts.push(
+            'クラウドへのアップロードに失敗したため、ローカル画像として配置しました（クラウドには保存されません）。\n' +
+              summarize(cloudFallbacks)
+          );
+        }
+        if (hardFailures.length > 0) {
+          alerts.push('画像の追加に失敗しました。\n' + summarize(hardFailures));
+        }
+        if (alerts.length > 0) {
+          window.alert(alerts.join('\n\n'));
+        }
+      } finally {
+        setIsUploading(false);
+        event.target.value = '';
+      }
     },
     [activeTemplate, updateActiveTemplate]
   );
 
   const startMove = useCallback(
     (event: ReactPointerEvent<HTMLDivElement>, elementId: string) => {
-      if (event.button !== 0 || !activeTemplate) return;
+      if (canvasMode !== 'edit' || event.button !== 0 || !activeTemplate) return;
       event.preventDefault();
       event.stopPropagation();
 
@@ -752,12 +944,12 @@ export function AdminTemplateStudioPage() {
         },
       });
     },
-    [activeTemplate]
+    [activeTemplate, canvasMode]
   );
 
   const startResize = useCallback(
     (event: ReactPointerEvent<HTMLButtonElement>, elementId: string, handle: ResizeHandle) => {
-      if (event.button !== 0 || !activeTemplate) return;
+      if (canvasMode !== 'edit' || event.button !== 0 || !activeTemplate) return;
       event.preventDefault();
       event.stopPropagation();
 
@@ -779,7 +971,7 @@ export function AdminTemplateStudioPage() {
         },
       });
     },
-    [activeTemplate]
+    [activeTemplate, canvasMode]
   );
 
   useEffect(() => {
@@ -852,6 +1044,8 @@ export function AdminTemplateStudioPage() {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
+      if (!isEditMode) return;
+
       const target = event.target as HTMLElement | null;
       if (
         target &&
@@ -876,7 +1070,7 @@ export function AdminTemplateStudioPage() {
 
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [selectedElementId, removeSelectedElement, duplicateSelectedElement]);
+  }, [selectedElementId, removeSelectedElement, duplicateSelectedElement, isEditMode]);
 
   const isPortrait =
     activeTemplate !== null && activeTemplate.canvasHeight >= activeTemplate.canvasWidth;
@@ -885,20 +1079,20 @@ export function AdminTemplateStudioPage() {
     <div className="studio-shell">
       <header className="studio-header">
         <div>
-          <p className="studio-kicker">Design Admin Console</p>
-          <h1>Template Layout Studio</h1>
+          <p className="studio-kicker">デザイン管理コンソール</p>
+          <h1>テンプレートレイアウトスタジオ</h1>
           <p className="studio-copy">
-            Cloud-saved template management with real-time updates. Add frames, upload images, move,
-            and resize freely.
+            クラウドに保存したテンプレートをリアルタイムで管理できます。フレーム追加、画像アップロード、
+            移動・リサイズを自由に行えます。
           </p>
         </div>
         <div className="studio-header-actions">
           <span className={`sync-badge sync-${syncState}`}>{syncMessage}</span>
           <button type="button" className="btn btn-secondary" onClick={createTemplate}>
-            New template
+            新規テンプレート
           </button>
           <button type="button" className="btn btn-primary" onClick={exportActiveTemplate}>
-            Export JSON
+            JSONを書き出し
           </button>
         </div>
       </header>
@@ -906,23 +1100,23 @@ export function AdminTemplateStudioPage() {
       <main className="studio-workspace">
         <aside className="studio-panel template-panel">
           <div className="panel-head">
-            <h2>Templates</h2>
-            <span>{templates.length} items</span>
+            <h2>テンプレート</h2>
+            <span>{templates.length} 件</span>
           </div>
 
           <div className="template-panel-actions">
             <button type="button" className="btn btn-secondary btn-sm" onClick={duplicateTemplate}>
-              Duplicate
+              複製
             </button>
             <button type="button" className="btn btn-danger btn-sm" onClick={deleteActiveTemplate}>
-              Delete
+              削除
             </button>
             <button
               type="button"
               className="btn btn-secondary btn-sm"
               onClick={() => importRef.current?.click()}
             >
-              Import JSON
+              JSONを読み込み
             </button>
           </div>
 
@@ -986,33 +1180,70 @@ export function AdminTemplateStudioPage() {
               <div className="canvas-toolbar">
                 <div className="toolbar-group">
                   <button type="button" className="btn btn-secondary btn-sm" onClick={addFrameElement}>
-                    Add frame
+                    フレーム追加
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={addImageSlotElement}
+                  >
+                    画像枠を追加
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={addTextMainSlotElement}
+                  >
+                    メインタイトル枠
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={addTextSubSlotElement}
+                  >
+                    サブタイトル枠
                   </button>
                   <button
                     type="button"
                     className="btn btn-secondary btn-sm"
                     onClick={() => imageUploadRef.current?.click()}
-                    disabled={isUploading}
+                    disabled={isUploading || !isEditMode}
                   >
-                    {isUploading ? 'Uploading...' : 'Upload template images'}
+                    {isUploading ? 'アップロード中...' : 'テンプレート画像をアップロード'}
+                  </button>
+                </div>
+                <div className="toolbar-group mode-toggle">
+                  <button
+                    type="button"
+                    className={`btn btn-secondary btn-sm ${isEditMode ? 'btn-mode-active' : ''}`}
+                    onClick={() => setCanvasMode('edit')}
+                  >
+                    編集モード
+                  </button>
+                  <button
+                    type="button"
+                    className={`btn btn-secondary btn-sm ${isEditMode ? '' : 'btn-mode-active'}`}
+                    onClick={() => setCanvasMode('view')}
+                  >
+                    チラシ全体ビュー
                   </button>
                 </div>
                 <div className="toolbar-group">
                   <button
                     type="button"
                     className="btn btn-secondary btn-sm"
-                    disabled={!selectedElement}
+                    disabled={!selectedElement || !isEditMode}
                     onClick={duplicateSelectedElement}
                   >
-                    Duplicate element
+                    要素を複製
                   </button>
                   <button
                     type="button"
                     className="btn btn-danger btn-sm"
-                    disabled={!selectedElement}
+                    disabled={!selectedElement || !isEditMode}
                     onClick={removeSelectedElement}
                   >
-                    Delete element
+                    要素を削除
                   </button>
                 </div>
                 <div className="toolbar-group">
@@ -1029,22 +1260,23 @@ export function AdminTemplateStudioPage() {
                   }}
                 >
                   <div
-                    className="canvas-paper"
+                    className={`canvas-paper ${isEditMode ? '' : 'view-only'}`}
                     style={{
                       width: activeTemplate.canvasWidth,
                       height: activeTemplate.canvasHeight,
                       transform: `scale(${canvasScale})`,
                     }}
-                    onPointerDown={() => setSelectedElementId(null)}
+                    onPointerDown={isEditMode ? () => setSelectedElementId(null) : undefined}
                   >
                     {activeTemplate.elements.map((element) => {
-                      const isSelected = element.id === selectedElementId;
-                      const isDragging = interaction?.elementId === element.id;
+                      const isSelected = isEditMode && element.id === selectedElementId;
+                      const isDragging = isEditMode && interaction?.elementId === element.id;
                       return (
                         <div
                           key={element.id}
                           className={`canvas-element ${isSelected ? 'selected' : ''} ${isDragging ? 'dragging' : ''}`}
                           data-kind={element.kind}
+                          data-placeholder-type={element.placeholderType}
                           style={{
                             left: element.x,
                             top: element.y,
@@ -1056,7 +1288,7 @@ export function AdminTemplateStudioPage() {
                             borderRadius: element.radius,
                             opacity: element.opacity,
                           }}
-                          onPointerDown={(event) => startMove(event, element.id)}
+                          onPointerDown={isEditMode ? (event) => startMove(event, element.id) : undefined}
                         >
                           {element.kind === 'image' && element.src ? (
                             <img
@@ -1076,7 +1308,7 @@ export function AdminTemplateStudioPage() {
                                 type="button"
                                 className={`resize-handle resize-${handle}`}
                                 onPointerDown={(event) => startResize(event, element.id, handle)}
-                                aria-label={`resize-${handle}`}
+                                aria-label={`サイズ変更-${handle}`}
                               />
                             ))}
                         </div>
@@ -1091,14 +1323,14 @@ export function AdminTemplateStudioPage() {
 
         <aside className="studio-panel inspector-panel">
           <div className="panel-head">
-            <h2>Properties</h2>
+            <h2>プロパティ</h2>
           </div>
 
           {activeTemplate ? (
             <>
               <div className="inspector-section">
                 <label className="field-label" htmlFor="template-name">
-                  Template name
+                  テンプレート名
                 </label>
                 <input
                   id="template-name"
@@ -1118,36 +1350,36 @@ export function AdminTemplateStudioPage() {
                     className={`preset-btn ${isPortrait ? 'active' : ''}`}
                     onClick={() => setCanvasPreset('portrait')}
                   >
-                    A4 portrait
+                    A4 縦
                   </button>
                   <button
                     type="button"
                     className={`preset-btn ${isPortrait ? '' : 'active'}`}
                     onClick={() => setCanvasPreset('landscape')}
                   >
-                    A4 landscape
+                    A4 横
                   </button>
                 </div>
               </div>
 
               <div className="inspector-section">
-                <h3>Layer order</h3>
+                <h3>レイヤー順</h3>
                 <div className="layer-actions">
                   <button
                     type="button"
                     className="btn btn-secondary btn-sm"
-                    disabled={!selectedElement}
+                    disabled={!selectedElement || !isEditMode}
                     onClick={() => moveSelectedLayer('backward')}
                   >
-                    Send back
+                    背面へ
                   </button>
                   <button
                     type="button"
                     className="btn btn-secondary btn-sm"
-                    disabled={!selectedElement}
+                    disabled={!selectedElement || !isEditMode}
                     onClick={() => moveSelectedLayer('forward')}
                   >
-                    Bring front
+                    前面へ
                   </button>
                 </div>
                 <div className="layer-list">
@@ -1155,25 +1387,54 @@ export function AdminTemplateStudioPage() {
                     <button
                       key={element.id}
                       type="button"
-                      className={`layer-item ${element.id === selectedElementId ? 'active' : ''}`}
+                      className={`layer-item ${isEditMode && element.id === selectedElementId ? 'active' : ''}`}
+                      disabled={!isEditMode}
                       onClick={() => setSelectedElementId(element.id)}
                     >
-                      <span>{element.kind === 'image' ? 'image' : 'frame'}</span>
+                      <span>
+                        {element.kind === 'image'
+                          ? '画像'
+                          : getPlaceholderLabel(element.placeholderType)}
+                      </span>
                       <strong>{element.name}</strong>
                     </button>
                   ))}
                   {activeTemplate.elements.length === 0 ? (
-                    <p className="empty-message">No elements yet.</p>
+                    <p className="empty-message">要素はまだありません。</p>
                   ) : null}
+                </div>
+                <div className="layer-overview">
+                  <p className="layer-overview-summary">
+                    {`全${layerOverview.length}レイヤー（前面→背面）`}
+                  </p>
+                  <div className="layer-overview-list">
+                    {layerOverview.map(({ element, stackOrder, boundsText }) => (
+                      <button
+                        key={`${element.id}-overview`}
+                        type="button"
+                        className={`layer-overview-item ${isEditMode && element.id === selectedElementId ? 'active' : ''}`}
+                        disabled={!isEditMode}
+                        onClick={() => setSelectedElementId(element.id)}
+                      >
+                        <div className="layer-overview-main">
+                          <span className="layer-overview-index">#{stackOrder}</span>
+                          <strong>{element.name}</strong>
+                        </div>
+                        <p className="layer-overview-meta">
+                          {`${element.kind === 'image' ? '画像' : getPlaceholderLabel(element.placeholderType)} / ${boundsText} / 透明度 ${Math.round(element.opacity * 100)}%`}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
 
               <div className="inspector-section">
-                <h3>Selected element</h3>
+                <h3>選択中の要素</h3>
                 {selectedElement ? (
                   <div className="element-fields">
                     <label className="field-label" htmlFor="element-name">
-                      Name
+                      名前
                     </label>
                     <input
                       id="element-name"
@@ -1203,7 +1464,7 @@ export function AdminTemplateStudioPage() {
                         />
                       </label>
                       <label className="field-label">
-                        Width
+                        幅
                         <input
                           className="field-input"
                           type="number"
@@ -1216,7 +1477,7 @@ export function AdminTemplateStudioPage() {
                         />
                       </label>
                       <label className="field-label">
-                        Height
+                        高さ
                         <input
                           className="field-input"
                           type="number"
@@ -1232,16 +1493,40 @@ export function AdminTemplateStudioPage() {
 
                     <div className="field-grid">
                       <label className="field-label">
-                        Border color
+                        枠線の色
+                        <select
+                          className="field-input"
+                          value={
+                            selectedElement.borderColor === TRANSPARENT_BORDER_COLOR
+                              ? TRANSPARENT_BORDER_COLOR
+                              : 'color'
+                          }
+                          onChange={(event) =>
+                            updateSelectedElement({
+                              borderColor:
+                                event.target.value === TRANSPARENT_BORDER_COLOR
+                                  ? TRANSPARENT_BORDER_COLOR
+                                  : DEFAULT_BORDER_COLOR,
+                            })
+                          }
+                        >
+                          <option value={TRANSPARENT_BORDER_COLOR}>透明</option>
+                          <option value="color">色を指定</option>
+                        </select>
                         <input
                           className="field-input"
                           type="color"
-                          value={selectedElement.borderColor}
+                          value={
+                            selectedElement.borderColor === TRANSPARENT_BORDER_COLOR
+                              ? DEFAULT_BORDER_COLOR
+                              : selectedElement.borderColor
+                          }
+                          disabled={selectedElement.borderColor === TRANSPARENT_BORDER_COLOR}
                           onChange={(event) => updateSelectedElement({ borderColor: event.target.value })}
                         />
                       </label>
                       <label className="field-label">
-                        Border width
+                        枠線の太さ
                         <input
                           className="field-input"
                           type="number"
@@ -1254,7 +1539,7 @@ export function AdminTemplateStudioPage() {
                         />
                       </label>
                       <label className="field-label">
-                        Opacity
+                        不透明度
                         <input
                           className="field-input"
                           type="number"
@@ -1268,7 +1553,7 @@ export function AdminTemplateStudioPage() {
                         />
                       </label>
                       <label className="field-label">
-                        Radius
+                        角丸
                         <input
                           className="field-input"
                           type="number"
@@ -1284,7 +1569,7 @@ export function AdminTemplateStudioPage() {
 
                     <div className="field-grid">
                       <label className="field-label">
-                        Border style
+                        枠線スタイル
                         <select
                           className="field-input"
                           value={selectedElement.borderStyle}
@@ -1294,14 +1579,14 @@ export function AdminTemplateStudioPage() {
                             })
                           }
                         >
-                          <option value="dashed">Dashed</option>
-                          <option value="solid">Solid</option>
+                          <option value="dashed">破線</option>
+                          <option value="solid">実線</option>
                         </select>
                       </label>
 
                       {selectedElement.kind === 'image' ? (
                         <label className="field-label">
-                          Image fit
+                          画像フィット
                           <select
                             className="field-input"
                             value={selectedElement.fit}
@@ -1311,24 +1596,40 @@ export function AdminTemplateStudioPage() {
                               })
                             }
                           >
-                            <option value="cover">Cover</option>
-                            <option value="contain">Contain</option>
+                            <option value="cover">塗りつぶし</option>
+                            <option value="contain">全体表示</option>
                           </select>
                         </label>
                       ) : (
-                        <div className="field-placeholder" />
+                        <label className="field-label">
+                          枠の用途
+                          <select
+                            className="field-input"
+                            value={selectedElement.placeholderType}
+                            onChange={(event) =>
+                              updateSelectedElement({
+                                placeholderType: normalizePlaceholderType(event.target.value),
+                              })
+                            }
+                          >
+                            <option value="generic">フレーム</option>
+                            <option value="image-slot">画像枠</option>
+                            <option value="text-main">メインタイトル枠</option>
+                            <option value="text-sub">サブタイトル枠</option>
+                          </select>
+                        </label>
                       )}
                     </div>
                   </div>
                 ) : (
-                  <p className="empty-message">Select an element to edit properties.</p>
+                  <p className="empty-message">編集する要素を選択してください。</p>
                 )}
               </div>
             </>
           ) : null}
 
           <div className="inspector-section works-section">
-            <h3>Works (real-time)</h3>
+            <h3>作品一覧（リアルタイム）</h3>
             <div className="works-list">
               {projects.map((project) => (
                 <article key={project.id} className="work-card">
@@ -1336,18 +1637,18 @@ export function AdminTemplateStudioPage() {
                     {project.thumbnailRef ? (
                       <img src={project.thumbnailRef} alt={project.name} loading="lazy" />
                     ) : (
-                      <span>No preview</span>
+                      <span>プレビューなし</span>
                     )}
                   </div>
                   <div className="work-meta">
                     <strong>{project.name}</strong>
-                    <p>Template: {project.templateId}</p>
-                    <p>User: {project.userId}</p>
-                    <p>Updated: {formatDateTime(project.updatedAt)}</p>
+                    <p>テンプレート: {project.templateId}</p>
+                    <p>ユーザー: {project.userId}</p>
+                    <p>更新: {formatDateTime(project.updatedAt)}</p>
                   </div>
                 </article>
               ))}
-              {projects.length === 0 ? <p className="empty-message">No works found.</p> : null}
+              {projects.length === 0 ? <p className="empty-message">作品がありません。</p> : null}
             </div>
           </div>
         </aside>

@@ -11,6 +11,41 @@ interface StudioDocument {
   templates?: unknown;
 }
 
+const UPLOAD_TIMEOUT_MS = 45_000;
+const DOWNLOAD_URL_TIMEOUT_MS = 15_000;
+const SAVE_TEMPLATES_TIMEOUT_MS = 15_000;
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, operation: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
+
+function stripLocalOnlySources(templates: LayoutTemplate[]): LayoutTemplate[] {
+  return templates.map((template) => ({
+    ...template,
+    elements: template.elements.map((element) => {
+      if (element.kind !== 'image' || !element.src) return element;
+      if (!element.src.startsWith('data:') && !element.src.startsWith('blob:')) return element;
+      const { src: _removed, ...rest } = element;
+      return rest;
+    }),
+  }));
+}
+
 function toIsoDate(value: unknown): string | undefined {
   if (value === null || value === undefined) return undefined;
 
@@ -61,13 +96,18 @@ export function subscribeStudioTemplates(
 
 export async function saveStudioTemplates(templates: LayoutTemplate[]): Promise<void> {
   const studioRef = doc(db, STUDIO_ROOT, STUDIO_DOC);
-  await setDoc(
-    studioRef,
-    {
-      templates,
-      updatedAt: serverTimestamp(),
-    },
-    { merge: true }
+  const cloudTemplates = stripLocalOnlySources(templates);
+  await withTimeout(
+    setDoc(
+      studioRef,
+      {
+        templates: cloudTemplates,
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    ),
+    SAVE_TEMPLATES_TIMEOUT_MS,
+    'saveStudioTemplates'
   );
 }
 
@@ -87,8 +127,8 @@ export async function uploadTemplateImage(
     storage,
     `studio/templates/${templateId}/images/${imageId}-${safeName}.${ext}`
   );
-  await uploadBytes(storageRef, file);
-  return getDownloadURL(storageRef);
+  await withTimeout(uploadBytes(storageRef, file), UPLOAD_TIMEOUT_MS, 'uploadBytes');
+  return withTimeout(getDownloadURL(storageRef), DOWNLOAD_URL_TIMEOUT_MS, 'getDownloadURL');
 }
 
 export function subscribeStudioProjects(
