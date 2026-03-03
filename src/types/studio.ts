@@ -3,12 +3,24 @@ export type FitMode = 'cover' | 'contain';
 export type BorderStyle = 'solid' | 'dashed';
 export type CanvasPreset = 'portrait' | 'landscape';
 export type PlaceholderType = 'generic' | 'image-slot' | 'text-main' | 'text-sub';
+export type TitleFontStyle = 'normal' | 'italic';
 
 export interface TemplateRect {
   x: number;
   y: number;
   width: number;
   height: number;
+}
+
+export interface TitleTextStyle {
+  presetId: string;
+  sampleText: string;
+  fontFamily: string;
+  fontSize: number;
+  fontWeight: number;
+  fontStyle: TitleFontStyle;
+  color: string;
+  letterSpacing: number;
 }
 
 export interface TemplateElement extends TemplateRect {
@@ -23,6 +35,7 @@ export interface TemplateElement extends TemplateRect {
   borderStyle: BorderStyle;
   opacity: number;
   radius: number;
+  titleTextStyle?: TitleTextStyle;
 }
 
 export interface LayoutTemplate {

@@ -22,12 +22,15 @@ import type {
   PlaceholderType,
   StudioProjectSummary,
   TemplateElement,
+  TitleFontStyle,
+  TitleTextStyle,
   TemplateRect,
 } from '../types/studio';
 
 type ResizeHandle = 'n' | 'e' | 's' | 'w' | 'ne' | 'nw' | 'se' | 'sw';
 type SyncState = 'connecting' | 'saving' | 'synced' | 'error';
 type CanvasMode = 'edit' | 'view';
+type InspectorTab = 'element' | 'layers' | 'works';
 
 interface InteractionState {
   mode: 'move' | 'resize';
@@ -44,6 +47,102 @@ const DEFAULT_CANVAS_HEIGHT = 1273;
 const HANDLE_POSITIONS: ResizeHandle[] = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'];
 const DEFAULT_BORDER_COLOR = '#1f7a67';
 const TRANSPARENT_BORDER_COLOR = 'transparent';
+const LOCAL_DRAFT_STORAGE_KEY = 'kaientai-template-studio-draft-v1';
+const LOCAL_DRAFT_HISTORY_STORAGE_KEY = 'kaientai-template-studio-draft-history-v1';
+const LOCAL_DRAFT_HISTORY_LIMIT = 20;
+const MIN_TITLE_FONT_SIZE = 12;
+const MAX_TITLE_FONT_SIZE = 120;
+const MIN_TITLE_LETTER_SPACING = -2;
+const MAX_TITLE_LETTER_SPACING = 12;
+const CUSTOM_TITLE_STYLE_PRESET_ID = 'custom';
+
+interface LocalDraftHistoryEntry {
+  savedAt: string;
+  serializedTemplates: string;
+}
+
+interface TitleStylePreset {
+  id: string;
+  label: string;
+  fontFamily: string;
+  fontWeight: number;
+  fontStyle: TitleFontStyle;
+  color: string;
+  letterSpacing: number;
+  mainFontSize: number;
+  subFontSize: number;
+}
+
+const TITLE_STYLE_PRESETS: TitleStylePreset[] = [
+  {
+    id: 'modern-impact',
+    label: 'モダンインパクト',
+    fontFamily: '"M PLUS 1p", sans-serif',
+    fontWeight: 800,
+    fontStyle: 'normal',
+    color: '#1d3557',
+    letterSpacing: 1.4,
+    mainFontSize: 56,
+    subFontSize: 28,
+  },
+  {
+    id: 'mincho-elegant',
+    label: '上品明朝',
+    fontFamily: '"Sawarabi Mincho", serif',
+    fontWeight: 700,
+    fontStyle: 'normal',
+    color: '#5c3d2e',
+    letterSpacing: 0.9,
+    mainFontSize: 50,
+    subFontSize: 27,
+  },
+  {
+    id: 'friendly-pop',
+    label: 'やわらかポップ',
+    fontFamily: '"Yusei Magic", sans-serif',
+    fontWeight: 700,
+    fontStyle: 'normal',
+    color: '#0b7285',
+    letterSpacing: 0.4,
+    mainFontSize: 52,
+    subFontSize: 26,
+  },
+  {
+    id: 'cinematic-serif',
+    label: 'シネマ風セリフ',
+    fontFamily: '"Noto Serif JP", serif',
+    fontWeight: 700,
+    fontStyle: 'italic',
+    color: '#6a040f',
+    letterSpacing: 1.1,
+    mainFontSize: 54,
+    subFontSize: 28,
+  },
+  {
+    id: 'creative-soft',
+    label: 'クリエイティブ',
+    fontFamily: '"Kaisei Decol", serif',
+    fontWeight: 700,
+    fontStyle: 'normal',
+    color: '#5f0f40',
+    letterSpacing: 0.8,
+    mainFontSize: 53,
+    subFontSize: 27,
+  },
+];
+
+const TITLE_STYLE_PRESET_MAP = new Map<string, TitleStylePreset>(
+  TITLE_STYLE_PRESETS.map((preset) => [preset.id, preset])
+);
+
+const TITLE_FONT_FAMILY_OPTIONS = [
+  { label: 'M PLUS 1p', value: '"M PLUS 1p", sans-serif' },
+  { label: 'Sawarabi Mincho', value: '"Sawarabi Mincho", serif' },
+  { label: 'Yusei Magic', value: '"Yusei Magic", sans-serif' },
+  { label: 'Noto Serif JP', value: '"Noto Serif JP", serif' },
+  { label: 'Kaisei Decol', value: '"Kaisei Decol", serif' },
+];
+
 const CLOUD_ERROR_HINTS: Record<string, string> = {
   'permission-denied': '権限がありません',
   unauthenticated: 'ログインが必要です',
@@ -65,9 +164,107 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function isTitlePlaceholderType(placeholderType: PlaceholderType): placeholderType is 'text-main' | 'text-sub' {
+  return placeholderType === 'text-main' || placeholderType === 'text-sub';
+}
+
+function getDefaultTitlePresetId(placeholderType: 'text-main' | 'text-sub'): string {
+  return placeholderType === 'text-main' ? 'modern-impact' : 'mincho-elegant';
+}
+
+function getDefaultTitleSampleText(placeholderType: 'text-main' | 'text-sub'): string {
+  return placeholderType === 'text-main' ? 'メインタイトル' : 'サブタイトル';
+}
+
 function clamp(value: number, min: number, max: number): number {
   if (Number.isNaN(value)) return min;
   return Math.min(max, Math.max(min, value));
+}
+
+function clampOrFallback(value: unknown, fallback: number, min: number, max: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return clamp(numeric, min, max);
+}
+
+function sanitizeColor(value: unknown, fallback: string): string {
+  if (typeof value !== 'string') return fallback;
+  const normalized = value.trim();
+  if (/^#[0-9a-fA-F]{6}$/.test(normalized)) return normalized;
+  return fallback;
+}
+
+function createTitleTextStyleFromPreset(
+  placeholderType: 'text-main' | 'text-sub',
+  presetId: string
+): TitleTextStyle {
+  const preset =
+    TITLE_STYLE_PRESET_MAP.get(presetId) ??
+    TITLE_STYLE_PRESET_MAP.get(getDefaultTitlePresetId(placeholderType)) ??
+    TITLE_STYLE_PRESETS[0];
+
+  return {
+    presetId: preset.id,
+    sampleText: getDefaultTitleSampleText(placeholderType),
+    fontFamily: preset.fontFamily,
+    fontSize: placeholderType === 'text-main' ? preset.mainFontSize : preset.subFontSize,
+    fontWeight: preset.fontWeight,
+    fontStyle: preset.fontStyle,
+    color: preset.color,
+    letterSpacing: preset.letterSpacing,
+  };
+}
+
+function normalizeTitleTextStyle(
+  candidate: unknown,
+  placeholderType: PlaceholderType
+): TitleTextStyle | undefined {
+  if (!isTitlePlaceholderType(placeholderType)) {
+    return undefined;
+  }
+
+  const fallback = createTitleTextStyleFromPreset(
+    placeholderType,
+    getDefaultTitlePresetId(placeholderType)
+  );
+
+  if (typeof candidate !== 'object' || candidate === null) {
+    return fallback;
+  }
+
+  const value = candidate as Partial<TitleTextStyle>;
+  const rawPresetId =
+    typeof value.presetId === 'string' && value.presetId.length > 0 ? value.presetId : fallback.presetId;
+  const presetBase =
+    rawPresetId === CUSTOM_TITLE_STYLE_PRESET_ID
+      ? fallback
+      : createTitleTextStyleFromPreset(placeholderType, rawPresetId);
+  const sampleText =
+    typeof value.sampleText === 'string' && value.sampleText.trim().length > 0
+      ? value.sampleText.trim().slice(0, 80)
+      : presetBase.sampleText;
+
+  return {
+    presetId:
+      rawPresetId === CUSTOM_TITLE_STYLE_PRESET_ID || TITLE_STYLE_PRESET_MAP.has(rawPresetId)
+        ? rawPresetId
+        : fallback.presetId,
+    sampleText,
+    fontFamily:
+      typeof value.fontFamily === 'string' && value.fontFamily.trim().length > 0
+        ? value.fontFamily
+        : presetBase.fontFamily,
+    fontSize: clampOrFallback(value.fontSize, presetBase.fontSize, MIN_TITLE_FONT_SIZE, MAX_TITLE_FONT_SIZE),
+    fontWeight: clampOrFallback(value.fontWeight, presetBase.fontWeight, 300, 900),
+    fontStyle: value.fontStyle === 'italic' ? 'italic' : 'normal',
+    color: sanitizeColor(value.color, presetBase.color),
+    letterSpacing: clampOrFallback(
+      value.letterSpacing,
+      presetBase.letterSpacing,
+      MIN_TITLE_LETTER_SPACING,
+      MAX_TITLE_LETTER_SPACING
+    ),
+  };
 }
 
 function clampRectToCanvas(rect: TemplateRect, canvasWidth: number, canvasHeight: number): TemplateRect {
@@ -126,6 +323,24 @@ function getPlaceholderLabel(placeholderType: PlaceholderType): string {
   }
 }
 
+function getTitlePreviewTextStyle(titleStyle: TitleTextStyle): {
+  fontFamily: string;
+  fontSize: string;
+  fontWeight: number;
+  fontStyle: TitleFontStyle;
+  color: string;
+  letterSpacing: string;
+} {
+  return {
+    fontFamily: titleStyle.fontFamily,
+    fontSize: `${titleStyle.fontSize}px`,
+    fontWeight: titleStyle.fontWeight,
+    fontStyle: titleStyle.fontStyle,
+    color: titleStyle.color,
+    letterSpacing: `${titleStyle.letterSpacing}px`,
+  };
+}
+
 function sanitizeTemplateElement(
   candidate: Partial<TemplateElement>,
   canvasWidth: number,
@@ -147,6 +362,7 @@ function sanitizeTemplateElement(
 
   const fit: FitMode = candidate.fit === 'contain' ? 'contain' : 'cover';
   const borderStyle: BorderStyle = candidate.borderStyle === 'solid' ? 'solid' : 'dashed';
+  const titleTextStyle = normalizeTitleTextStyle(candidate.titleTextStyle, placeholderType);
 
   return {
     id: typeof candidate.id === 'string' ? candidate.id : createId(),
@@ -166,6 +382,7 @@ function sanitizeTemplateElement(
     borderStyle,
     opacity: clamp(Number(candidate.opacity) || 1, 0.1, 1),
     radius: clamp(Number(candidate.radius) || 14, 0, 80),
+    titleTextStyle,
     ...rect,
   };
 }
@@ -195,6 +412,80 @@ function sanitizeTemplate(candidate: Partial<LayoutTemplate>, index: number): La
         ? candidate.updatedAt
         : nowIso(),
   };
+}
+
+function getLatestTemplateUpdatedAt(templates: LayoutTemplate[]): number {
+  return templates.reduce((latest, template) => {
+    const timestamp = new Date(template.updatedAt).getTime();
+    if (Number.isNaN(timestamp)) return latest;
+    return Math.max(latest, timestamp);
+  }, 0);
+}
+
+function toSanitizedTemplates(raw: unknown): LayoutTemplate[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((template, index) => sanitizeTemplate(template as Partial<LayoutTemplate>, index));
+}
+
+function parseSerializedTemplates(serializedTemplates: string): LayoutTemplate[] {
+  try {
+    const parsed = JSON.parse(serializedTemplates);
+    return toSanitizedTemplates(parsed);
+  } catch {
+    return [];
+  }
+}
+
+function readLocalDraftTemplates(): LayoutTemplate[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(LOCAL_DRAFT_STORAGE_KEY);
+    if (!raw) return [];
+    return parseSerializedTemplates(raw);
+  } catch {
+    return [];
+  }
+}
+
+function readLocalDraftHistory(): LocalDraftHistoryEntry[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const raw = window.localStorage.getItem(LOCAL_DRAFT_HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (entry): entry is LocalDraftHistoryEntry =>
+          typeof entry === 'object' &&
+          entry !== null &&
+          typeof (entry as LocalDraftHistoryEntry).savedAt === 'string' &&
+          typeof (entry as LocalDraftHistoryEntry).serializedTemplates === 'string'
+      )
+      .slice(-LOCAL_DRAFT_HISTORY_LIMIT);
+  } catch {
+    return [];
+  }
+}
+
+function appendLocalDraftHistory(serializedTemplates: string): LocalDraftHistoryEntry[] {
+  if (typeof window === 'undefined') return [];
+  const history = readLocalDraftHistory();
+  const latest = history.length > 0 ? history[history.length - 1] : null;
+  if (latest && latest.serializedTemplates === serializedTemplates) {
+    return history;
+  }
+
+  const nextHistory = [
+    ...history,
+    {
+      savedAt: nowIso(),
+      serializedTemplates,
+    },
+  ].slice(-LOCAL_DRAFT_HISTORY_LIMIT);
+
+  window.localStorage.setItem(LOCAL_DRAFT_HISTORY_STORAGE_KEY, JSON.stringify(nextHistory));
+  return nextHistory;
 }
 
 function createBlankTemplate(name: string): LayoutTemplate {
@@ -325,13 +616,18 @@ export function AdminTemplateStudioPage() {
   const [syncMessage, setSyncMessage] = useState<string>('クラウドに接続中...');
   const [isUploading, setIsUploading] = useState<boolean>(false);
   const [cloudReady, setCloudReady] = useState<boolean>(false);
+  const [hasHydratedTemplates, setHasHydratedTemplates] = useState<boolean>(false);
+  const [localHistoryCount, setLocalHistoryCount] = useState<number>(0);
   const [canvasMode, setCanvasMode] = useState<CanvasMode>('edit');
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>('element');
 
   const canvasViewportRef = useRef<HTMLDivElement | null>(null);
   const imageUploadRef = useRef<HTMLInputElement | null>(null);
   const importRef = useRef<HTMLInputElement | null>(null);
   const saveTimerRef = useRef<number | null>(null);
   const lastCloudSerializedRef = useRef<string | null>(null);
+  const lastLocalSerializedRef = useRef<string | null>(null);
+  const localDraftTemplatesRef = useRef<LayoutTemplate[]>([]);
 
   const activeTemplate = useMemo(
     () => templates.find((template) => template.id === activeTemplateId) ?? null,
@@ -361,34 +657,79 @@ export function AdminTemplateStudioPage() {
   const serializedTemplates = useMemo(() => JSON.stringify(templates), [templates]);
 
   useEffect(() => {
+    const history = readLocalDraftHistory();
+    let localDraft = readLocalDraftTemplates();
+    if (localDraft.length === 0 && history.length > 0) {
+      for (let index = history.length - 1; index >= 0; index -= 1) {
+        const recovered = parseSerializedTemplates(history[index].serializedTemplates);
+        if (recovered.length > 0) {
+          localDraft = recovered;
+          break;
+        }
+      }
+    }
+
+    localDraftTemplatesRef.current = localDraft;
+    lastLocalSerializedRef.current = localDraft.length > 0 ? JSON.stringify(localDraft) : null;
+    setLocalHistoryCount(history.length);
+  }, []);
+
+  useEffect(() => {
     setSyncState('connecting');
     setSyncMessage('クラウドに接続中...');
 
     const unsubscribe = subscribeStudioTemplates(
       (remoteTemplates) => {
-        const sanitized =
+        const sanitizedRemote =
           remoteTemplates.length > 0
             ? remoteTemplates.map((template, index) =>
                 sanitizeTemplate(template as Partial<LayoutTemplate>, index)
               )
-            : [createBlankTemplate('テンプレート 1')];
+            : [];
+
+        const remoteLatest = getLatestTemplateUpdatedAt(sanitizedRemote);
+        const localLatest = getLatestTemplateUpdatedAt(localDraftTemplatesRef.current);
+        const prefersLocalDraft = localLatest > remoteLatest && localDraftTemplatesRef.current.length > 0;
+        const merged =
+          sanitizedRemote.length > 0
+            ? prefersLocalDraft
+              ? localDraftTemplatesRef.current
+              : sanitizedRemote
+            : localDraftTemplatesRef.current.length > 0
+              ? localDraftTemplatesRef.current
+              : [createBlankTemplate('テンプレート 1')];
 
         lastCloudSerializedRef.current =
-          remoteTemplates.length > 0 ? JSON.stringify(sanitized) : JSON.stringify([]);
+          remoteTemplates.length > 0 ? JSON.stringify(sanitizedRemote) : JSON.stringify([]);
 
-        setTemplates(sanitized);
+        setTemplates(merged);
         setActiveTemplateId((previousId) => {
-          if (sanitized.some((template) => template.id === previousId)) return previousId;
-          return sanitized[0].id;
+          if (merged.some((template) => template.id === previousId)) return previousId;
+          return merged[0].id;
         });
         setCloudReady(true);
+        setHasHydratedTemplates(true);
         setSyncState('synced');
         setSyncMessage('同期済み');
       },
       (error) => {
+        const fallback =
+          localDraftTemplatesRef.current.length > 0
+            ? localDraftTemplatesRef.current
+            : [createBlankTemplate('テンプレート 1')];
+        setTemplates(fallback);
+        setActiveTemplateId((previousId) => {
+          if (fallback.some((template) => template.id === previousId)) return previousId;
+          return fallback[0].id;
+        });
         setCloudReady(true);
+        setHasHydratedTemplates(true);
         setSyncState('error');
-        setSyncMessage(resolveCloudErrorMessage(error, 'connect'));
+        if (localDraftTemplatesRef.current.length > 0) {
+          setSyncMessage('クラウド接続失敗（ローカル下書きを表示中）');
+        } else {
+          setSyncMessage(resolveCloudErrorMessage(error, 'connect'));
+        }
       }
     );
 
@@ -444,6 +785,21 @@ export function AdminTemplateStudioPage() {
       }
     };
   }, [templates, serializedTemplates, cloudReady]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!hasHydratedTemplates) return;
+    try {
+      window.localStorage.setItem(LOCAL_DRAFT_STORAGE_KEY, serializedTemplates);
+      if (serializedTemplates !== lastLocalSerializedRef.current) {
+        const nextHistory = appendLocalDraftHistory(serializedTemplates);
+        setLocalHistoryCount(nextHistory.length);
+        lastLocalSerializedRef.current = serializedTemplates;
+      }
+    } catch {
+      // Ignore storage quota/permission errors and continue cloud sync flow.
+    }
+  }, [serializedTemplates, hasHydratedTemplates]);
 
   useEffect(() => {
     if (!activeTemplate) return;
@@ -516,18 +872,22 @@ export function AdminTemplateStudioPage() {
           if (element.id !== selectedElementId) return element;
 
           const merged = { ...element, ...changes };
+          const placeholderType = normalizePlaceholderType(merged.placeholderType);
           const rect = clampRectToCanvas(merged, template.canvasWidth, template.canvasHeight);
           const fit: FitMode = merged.fit === 'contain' ? 'contain' : 'cover';
           const borderStyle: BorderStyle = merged.borderStyle === 'solid' ? 'solid' : 'dashed';
+          const titleTextStyle = normalizeTitleTextStyle(merged.titleTextStyle, placeholderType);
 
           return {
             ...merged,
             ...rect,
+            placeholderType,
             fit,
             borderStyle,
             borderWidth: clamp(merged.borderWidth, 0, 16),
             opacity: clamp(merged.opacity, 0.1, 1),
             radius: clamp(merged.radius, 0, 80),
+            titleTextStyle,
           };
         });
 
@@ -539,6 +899,60 @@ export function AdminTemplateStudioPage() {
     },
     [selectedElementId, updateActiveTemplate]
   );
+
+  const selectedTitleTextStyle = useMemo(() => {
+    if (!selectedElement) return null;
+    return normalizeTitleTextStyle(selectedElement.titleTextStyle, selectedElement.placeholderType) ?? null;
+  }, [selectedElement]);
+
+  const updateSelectedTitleTextStyle = useCallback(
+    (updater: (current: TitleTextStyle, placeholderType: 'text-main' | 'text-sub') => TitleTextStyle) => {
+      if (!selectedElement || !isTitlePlaceholderType(selectedElement.placeholderType)) return;
+      const currentStyle = normalizeTitleTextStyle(
+        selectedElement.titleTextStyle,
+        selectedElement.placeholderType
+      );
+      if (!currentStyle) return;
+
+      const nextStyle = normalizeTitleTextStyle(
+        updater(currentStyle, selectedElement.placeholderType),
+        selectedElement.placeholderType
+      );
+      if (!nextStyle) return;
+
+      updateSelectedElement({ titleTextStyle: nextStyle });
+    },
+    [selectedElement, updateSelectedElement]
+  );
+
+  const restoreLatestLocalDraft = useCallback(() => {
+    const history = readLocalDraftHistory();
+    if (history.length === 0) {
+      window.alert('復元できるローカル履歴が見つかりませんでした。');
+      return;
+    }
+
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const entry = history[index];
+      const recoveredTemplates = parseSerializedTemplates(entry.serializedTemplates);
+      if (recoveredTemplates.length === 0) continue;
+
+      localDraftTemplatesRef.current = recoveredTemplates;
+      lastLocalSerializedRef.current = entry.serializedTemplates;
+      setTemplates(recoveredTemplates);
+      setActiveTemplateId((previousId) => {
+        if (recoveredTemplates.some((template) => template.id === previousId)) return previousId;
+        return recoveredTemplates[0].id;
+      });
+      setSelectedElementId(null);
+      setHasHydratedTemplates(true);
+      setSyncState('synced');
+      setSyncMessage(`ローカル履歴を復元しました（${formatDateTime(entry.savedAt)}）`);
+      return;
+    }
+
+    window.alert('ローカル履歴の読み込みに失敗しました。');
+  }, []);
 
   const createTemplate = useCallback(() => {
     const newTemplate = createBlankTemplate(`テンプレート ${templates.length + 1}`);
@@ -657,6 +1071,7 @@ export function AdminTemplateStudioPage() {
         borderStyle: config.borderStyle,
         opacity: 1,
         radius: config.radius,
+        titleTextStyle: normalizeTitleTextStyle(undefined, placeholderType),
       };
 
       updateActiveTemplate((template) => ({
@@ -1091,6 +1506,9 @@ export function AdminTemplateStudioPage() {
           <button type="button" className="btn btn-secondary" onClick={createTemplate}>
             新規テンプレート
           </button>
+          <button type="button" className="btn btn-secondary" onClick={restoreLatestLocalDraft}>
+            ローカル復元{localHistoryCount > 0 ? ` (${localHistoryCount})` : ''}
+          </button>
           <button type="button" className="btn btn-primary" onClick={exportActiveTemplate}>
             JSONを書き出し
           </button>
@@ -1140,27 +1558,51 @@ export function AdminTemplateStudioPage() {
                       height: Math.round(template.canvasHeight * previewScale),
                     }}
                   >
-                    {template.elements.map((element) => (
-                      <div
-                        key={element.id}
-                        className={`template-preview-element ${element.kind}`}
-                        style={{
-                          left: Math.round(element.x * previewScale),
-                          top: Math.round(element.y * previewScale),
-                          width: Math.max(2, Math.round(element.width * previewScale)),
-                          height: Math.max(2, Math.round(element.height * previewScale)),
-                          borderColor: element.borderColor,
-                          borderWidth: Math.max(1, Math.round(element.borderWidth * previewScale)),
-                          borderStyle: element.borderStyle,
-                          borderRadius: Math.round(element.radius * previewScale),
-                          opacity: element.opacity,
-                        }}
-                      >
-                        {element.kind === 'image' && element.src ? (
-                          <img src={element.src} alt="" loading="lazy" />
-                        ) : null}
-                      </div>
-                    ))}
+                    {template.elements.map((element) => {
+                      const titleTextStyle = normalizeTitleTextStyle(
+                        element.titleTextStyle,
+                        element.placeholderType
+                      );
+
+                      return (
+                        <div
+                          key={element.id}
+                          className={`template-preview-element ${element.kind}`}
+                          style={{
+                            left: Math.round(element.x * previewScale),
+                            top: Math.round(element.y * previewScale),
+                            width: Math.max(2, Math.round(element.width * previewScale)),
+                            height: Math.max(2, Math.round(element.height * previewScale)),
+                            borderColor: element.borderColor,
+                            borderWidth: Math.max(1, Math.round(element.borderWidth * previewScale)),
+                            borderStyle: element.borderStyle,
+                            borderRadius: Math.round(element.radius * previewScale),
+                            opacity: element.opacity,
+                          }}
+                        >
+                          {element.kind === 'image' && element.src ? (
+                            <img src={element.src} alt="" loading="lazy" />
+                          ) : null}
+                          {titleTextStyle ? (
+                            <span
+                              className="template-preview-text"
+                              style={{
+                                ...getTitlePreviewTextStyle(titleTextStyle),
+                                fontSize: `${Math.max(
+                                  6,
+                                  Math.round(titleTextStyle.fontSize * previewScale)
+                                )}px`,
+                                letterSpacing: `${Math.round(
+                                  titleTextStyle.letterSpacing * previewScale * 10
+                                ) / 10}px`,
+                              }}
+                            >
+                              {titleTextStyle.sampleText}
+                            </span>
+                          ) : null}
+                        </div>
+                      );
+                    })}
                   </div>
                   <div className="template-card-text">
                     <strong>{template.name}</strong>
@@ -1271,6 +1713,10 @@ export function AdminTemplateStudioPage() {
                     {activeTemplate.elements.map((element) => {
                       const isSelected = isEditMode && element.id === selectedElementId;
                       const isDragging = isEditMode && interaction?.elementId === element.id;
+                      const titleTextStyle = normalizeTitleTextStyle(
+                        element.titleTextStyle,
+                        element.placeholderType
+                      );
                       return (
                         <div
                           key={element.id}
@@ -1297,6 +1743,13 @@ export function AdminTemplateStudioPage() {
                               draggable={false}
                               style={{ objectFit: element.fit }}
                             />
+                          ) : titleTextStyle ? (
+                            <span
+                              className="canvas-element-text-preview"
+                              style={getTitlePreviewTextStyle(titleTextStyle)}
+                            >
+                              {titleTextStyle.sampleText}
+                            </span>
                           ) : (
                             <span>{element.name}</span>
                           )}
@@ -1325,44 +1778,70 @@ export function AdminTemplateStudioPage() {
           <div className="panel-head">
             <h2>プロパティ</h2>
           </div>
+          <div className="inspector-tabs">
+            <button
+              type="button"
+              className={`inspector-tab ${inspectorTab === 'element' ? 'active' : ''}`}
+              onClick={() => setInspectorTab('element')}
+            >
+              要素
+            </button>
+            <button
+              type="button"
+              className={`inspector-tab ${inspectorTab === 'layers' ? 'active' : ''}`}
+              onClick={() => setInspectorTab('layers')}
+            >
+              レイヤー
+            </button>
+            <button
+              type="button"
+              className={`inspector-tab ${inspectorTab === 'works' ? 'active' : ''}`}
+              onClick={() => setInspectorTab('works')}
+            >
+              作品
+            </button>
+          </div>
 
           {activeTemplate ? (
             <>
-              <div className="inspector-section">
-                <label className="field-label" htmlFor="template-name">
-                  テンプレート名
-                </label>
-                <input
-                  id="template-name"
-                  className="field-input"
-                  type="text"
-                  value={activeTemplate.name}
-                  onChange={(event) =>
-                    updateActiveTemplate((template) => ({
-                      ...template,
-                      name: event.target.value,
-                    }))
-                  }
-                />
-                <div className="preset-switch">
-                  <button
-                    type="button"
-                    className={`preset-btn ${isPortrait ? 'active' : ''}`}
-                    onClick={() => setCanvasPreset('portrait')}
-                  >
-                    A4 縦
-                  </button>
-                  <button
-                    type="button"
-                    className={`preset-btn ${isPortrait ? '' : 'active'}`}
-                    onClick={() => setCanvasPreset('landscape')}
-                  >
-                    A4 横
-                  </button>
+              {inspectorTab === 'element' ? (
+                <div className="inspector-section">
+                  <label className="field-label" htmlFor="template-name">
+                    テンプレート名
+                  </label>
+                  <input
+                    id="template-name"
+                    className="field-input"
+                    type="text"
+                    value={activeTemplate.name}
+                    onChange={(event) =>
+                      updateActiveTemplate((template) => ({
+                        ...template,
+                        name: event.target.value,
+                      }))
+                    }
+                  />
+                  <div className="preset-switch">
+                    <button
+                      type="button"
+                      className={`preset-btn ${isPortrait ? 'active' : ''}`}
+                      onClick={() => setCanvasPreset('portrait')}
+                    >
+                      A4 縦
+                    </button>
+                    <button
+                      type="button"
+                      className={`preset-btn ${isPortrait ? '' : 'active'}`}
+                      onClick={() => setCanvasPreset('landscape')}
+                    >
+                      A4 横
+                    </button>
+                  </div>
                 </div>
-              </div>
+              ) : null}
 
-              <div className="inspector-section">
+              {inspectorTab === 'layers' ? (
+                <div className="inspector-section">
                 <h3>レイヤー順</h3>
                 <div className="layer-actions">
                   <button
@@ -1403,10 +1882,10 @@ export function AdminTemplateStudioPage() {
                     <p className="empty-message">要素はまだありません。</p>
                   ) : null}
                 </div>
-                <div className="layer-overview">
-                  <p className="layer-overview-summary">
-                    {`全${layerOverview.length}レイヤー（前面→背面）`}
-                  </p>
+                <details className="layer-overview-details">
+                  <summary className="layer-overview-summary">
+                    {`全${layerOverview.length}レイヤー（前面→背面）の詳細`}
+                  </summary>
                   <div className="layer-overview-list">
                     {layerOverview.map(({ element, stackOrder, boundsText }) => (
                       <button
@@ -1426,10 +1905,12 @@ export function AdminTemplateStudioPage() {
                       </button>
                     ))}
                   </div>
-                </div>
+                </details>
               </div>
+              ) : null}
 
-              <div className="inspector-section">
+              {inspectorTab === 'element' ? (
+                <div className="inspector-section">
                 <h3>選択中の要素</h3>
                 {selectedElement ? (
                   <div className="element-fields">
@@ -1620,15 +2101,180 @@ export function AdminTemplateStudioPage() {
                         </label>
                       )}
                     </div>
+
+                    {selectedElement.kind === 'frame' &&
+                    isTitlePlaceholderType(selectedElement.placeholderType) &&
+                    selectedTitleTextStyle ? (
+                      <div className="title-style-editor">
+                        <h4>タイトル文字スタイル（編集者ビュー）</h4>
+                        <div className="field-grid">
+                          <label className="field-label">
+                            デザインプリセット
+                            <select
+                              className="field-input"
+                              value={selectedTitleTextStyle.presetId}
+                              onChange={(event) => {
+                                const presetId = event.target.value;
+                                if (presetId === CUSTOM_TITLE_STYLE_PRESET_ID) return;
+                                updateSelectedTitleTextStyle((current, placeholderType) => ({
+                                  ...createTitleTextStyleFromPreset(placeholderType, presetId),
+                                  sampleText: current.sampleText,
+                                  presetId,
+                                }));
+                              }}
+                            >
+                              {TITLE_STYLE_PRESETS.map((preset) => (
+                                <option key={preset.id} value={preset.id}>
+                                  {preset.label}
+                                </option>
+                              ))}
+                              <option value={CUSTOM_TITLE_STYLE_PRESET_ID}>カスタム</option>
+                            </select>
+                          </label>
+
+                          <label className="field-label">
+                            フォント
+                            <select
+                              className="field-input"
+                              value={selectedTitleTextStyle.fontFamily}
+                              onChange={(event) =>
+                                updateSelectedTitleTextStyle((current) => ({
+                                  ...current,
+                                  presetId: CUSTOM_TITLE_STYLE_PRESET_ID,
+                                  fontFamily: event.target.value,
+                                }))
+                              }
+                            >
+                              {!TITLE_FONT_FAMILY_OPTIONS.some(
+                                (option) => option.value === selectedTitleTextStyle.fontFamily
+                              ) ? (
+                                <option value={selectedTitleTextStyle.fontFamily}>
+                                  カスタムフォント
+                                </option>
+                              ) : null}
+                              {TITLE_FONT_FAMILY_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>
+                                  {option.label}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        </div>
+
+                        <div className="field-grid">
+                          <label className="field-label">
+                            文字色
+                            <input
+                              className="field-input"
+                              type="color"
+                              value={selectedTitleTextStyle.color}
+                              onChange={(event) =>
+                                updateSelectedTitleTextStyle((current) => ({
+                                  ...current,
+                                  presetId: CUSTOM_TITLE_STYLE_PRESET_ID,
+                                  color: event.target.value,
+                                }))
+                              }
+                            />
+                          </label>
+                          <label className="field-label">
+                            文字サイズ
+                            <input
+                              className="field-input"
+                              type="number"
+                              min={MIN_TITLE_FONT_SIZE}
+                              max={MAX_TITLE_FONT_SIZE}
+                              value={selectedTitleTextStyle.fontSize}
+                              onChange={(event) =>
+                                updateSelectedTitleTextStyle((current) => ({
+                                  ...current,
+                                  presetId: CUSTOM_TITLE_STYLE_PRESET_ID,
+                                  fontSize: Number(event.target.value),
+                                }))
+                              }
+                            />
+                          </label>
+                          <label className="field-label">
+                            太さ
+                            <select
+                              className="field-input"
+                              value={selectedTitleTextStyle.fontWeight}
+                              onChange={(event) =>
+                                updateSelectedTitleTextStyle((current) => ({
+                                  ...current,
+                                  presetId: CUSTOM_TITLE_STYLE_PRESET_ID,
+                                  fontWeight: Number(event.target.value),
+                                }))
+                              }
+                            >
+                              <option value={400}>400</option>
+                              <option value={500}>500</option>
+                              <option value={600}>600</option>
+                              <option value={700}>700</option>
+                              <option value={800}>800</option>
+                              <option value={900}>900</option>
+                            </select>
+                          </label>
+                          <label className="field-label">
+                            字間
+                            <input
+                              className="field-input"
+                              type="number"
+                              step={0.1}
+                              min={MIN_TITLE_LETTER_SPACING}
+                              max={MAX_TITLE_LETTER_SPACING}
+                              value={selectedTitleTextStyle.letterSpacing}
+                              onChange={(event) =>
+                                updateSelectedTitleTextStyle((current) => ({
+                                  ...current,
+                                  presetId: CUSTOM_TITLE_STYLE_PRESET_ID,
+                                  letterSpacing: Number(event.target.value),
+                                }))
+                              }
+                            />
+                          </label>
+                        </div>
+
+                        <label className="field-label">
+                          プレビュー用テキスト
+                          <input
+                            className="field-input"
+                            type="text"
+                            maxLength={80}
+                            value={selectedTitleTextStyle.sampleText}
+                            onChange={(event) =>
+                              updateSelectedTitleTextStyle((current) => ({
+                                ...current,
+                                sampleText: event.target.value,
+                              }))
+                            }
+                          />
+                        </label>
+
+                        <div className="title-style-preview">
+                          <p>管理者ビュー プレビュー</p>
+                          <div className="title-style-preview-surface">
+                            <span
+                              className="title-style-preview-text"
+                              style={getTitlePreviewTextStyle(selectedTitleTextStyle)}
+                            >
+                              {selectedTitleTextStyle.sampleText}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    ) : null}
                   </div>
                 ) : (
                   <p className="empty-message">編集する要素を選択してください。</p>
                 )}
               </div>
+              ) : null}
             </>
           ) : null}
 
-          <div className="inspector-section works-section">
+          {inspectorTab === 'works' ? (
+            <div className="inspector-section works-section">
             <h3>作品一覧（リアルタイム）</h3>
             <div className="works-list">
               {projects.map((project) => (
@@ -1651,6 +2297,7 @@ export function AdminTemplateStudioPage() {
               {projects.length === 0 ? <p className="empty-message">作品がありません。</p> : null}
             </div>
           </div>
+          ) : null}
         </aside>
       </main>
 

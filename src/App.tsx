@@ -1,8 +1,8 @@
-import { AdminTemplateStudioPage } from './pages/AdminTemplateStudioPage';
-import './styles/admin-studio.css';
+import { CampaignComposerPage } from './pages/CampaignComposerPage';
+import './styles/campaign-composer.css';
 
 function App() {
-  return <AdminTemplateStudioPage />;
+  return <CampaignComposerPage />;
 }
 
 export default App;
